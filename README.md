@@ -2,7 +2,7 @@
 
 This is a small project to develop an RNN language model to generate recipes(for food). Included is the code needed to scrape training data `get_pages.py` and `parse_html.py` as well as for training the model itself `recipe_rnn.py`
 
-##Data
+## Data
 You can scrape html pages using the following(e.g. to get recipes 10000 to 20000):
 
 ```
@@ -19,7 +19,7 @@ There is also a flag in `parse_html.py` to include instructions as well as ingre
 
 Regardless, this generates a set of `*_ingredients.txt` files containing the recipe from each html page.
 
-##Embedding
+## Embedding
 
 You will need to train a word embedding before training the RNN. I used the [GloVe repo](https://github.com/stanfordnlp/GloVe) and trained a GloVe embedding on the recipe corpus above, length of 100.
 
@@ -29,7 +29,7 @@ Before running GloVe, run the following to clean the text files and concatenate 
 python recipe_rnn.py --concat recipe_concat.txt
 ```
 
-##Training
+## Training
 
 Once you've got the GloVe embedding ready, you can train the RNN like so:
 
