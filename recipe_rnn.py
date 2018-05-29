@@ -68,6 +68,8 @@ parser.add_argument('--prime_str', type=str, default="chocolate",
                     help='String to prime recipe generation with')
 parser.add_argument('--print_every', type=int, default=100,
                     help='Frequency to test/output stats during training')
+parser.add_argument('--max_length', type=int, default=100,
+                    help='Maximum recipe length')
 parser.add_argument('--concat', type=str, default=None,
                     help='Clean and concatenate recipe files for embedding processing, then exit')
 args = parser.parse_args()
@@ -181,6 +183,10 @@ if(args.load is None):
                 else: #unknown word
                     tokens.append(word_dict["<unk>"])
         tokens.append(word_dict["<eos>"])
+        if(len(tokens) == 0):
+            continue
+        elif(len(tokens) > args.max_length):
+            continue
         var = torch.LongTensor(tokens)
         if(args.gpu):
             var = var.cuda(gpu)
@@ -191,7 +197,7 @@ if(args.load is None):
     #print([ele[0] for ele in sorted(recipe_tensors)])
     recipe_tensors = [ele[1] for ele in sorted(recipe_tensors, reverse = True)]
     recipe_tensors = torch.nn.utils.rnn.pad_sequence(recipe_tensors).permute(1,0)
-    print("Loaded recipes")
+    print("Loaded " + str(recipe_tensors.size(0)) + " recipes")
 
 #Set up and train!
 
@@ -346,9 +352,9 @@ else:
 
         if epoch % args.print_every == 0:
             recipe_model.train(False)
-            print('[%s (%d %d%%) %.4f]' % (time_since(start), epoch, epoch / args.iters * 100, loss_avg / args.print_every))
+            print('[%s (%d %d%%) %.4f]' % (time_since(start), epoch, epoch / args.iters * args.batch_size, loss_avg / args.print_every))
             print('loss: ', loss)
-            print(generate(recipe_model, args.prime_str, 40, 0.8, cuda=args.gpu) + "\n")
+            print(generate(recipe_model, args.prime_str, args.max_length, 0.8, cuda=args.gpu) + "\n")
             loss_avg = 0
 
     #Save model to file
@@ -362,7 +368,7 @@ else:
 #"""### Let's try sampling with low temperature:"""
 recipe_model.train(False)
 for prop in range(10):
-    print(generate(recipe_model, prime_str=args.prime_str, temperature= 0.8, cuda=args.gpu))
+    print(generate(recipe_model, args.prime_str, args.max_length, temperature= 0.8, cuda=args.gpu))
 
 
 #print(generate(recipe_model, prime_str="sugar", cuda=args.gpu))

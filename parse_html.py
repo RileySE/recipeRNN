@@ -14,7 +14,8 @@ for f in files:
 
     html_file = open(html_filename)
 
-    outfile = open(html_filename.replace(".html","") + "_ingredients.txt", "w")
+    outfile_name = html_filename.replace(".html","") + "_ingredients.txt"
+    outfile = open(outfile_name, "w")
 
     recipe_name = ""
     line = html_file.readline()
@@ -27,6 +28,7 @@ for f in files:
             #Getting this one page repeatedly for missing recipes it seems. Want to avoid replicating this one in the database
             if("Three Cheese Italian Style Chicken Sausage Skillet Pizza" in recipe_name):
                 outfile.close()
+                os.remove(outfile_name)
                 break
             #print(recipe_name)
             outfile.write(recipe_name + "\n")
