@@ -144,6 +144,9 @@ parser.add_argument('--instructions', action='store_true', default = False,
                     help='Use recipe files containing both ingredients and instructions versus only ingredients. This makes the task much more difficult.')
 parser.add_argument('--instr_embedding', type=str, default='./glove_recipe_instr_vectors_100.txt',
                     help='Path of GloVe embedding definition file for instructions')
+parser.add_argument('--instr_load', type=str, default=None,
+                    help='Path to saved weights for instruction generation network')
+
 parser.add_argument('--concat', type=str, default=None,
                     help='Clean and concatenate recipe files for embedding processing, then exit')
 args = parser.parse_args()
@@ -295,7 +298,7 @@ if(args.load is None):
     if(args.instructions):
         #max length here needs to be very large so that we load instructions for every recipe loaded above
         to_load = [name for name in instr_recipe_files if name.replace("_instructions.txt","_ingredients.txt") in recipes_loaded]
-        instr_recipe_tensors, instr_recipes_loaded = load_recipes(to_load, word_2_ind, 1000000, gpu)
+        instr_recipe_tensors, instr_recipes_loaded = load_recipes(to_load, instr_word_2_ind, 1000000, gpu)
 
     print("Loaded " + str(recipe_tensors.size(0)) + " recipes")
 
@@ -418,6 +421,7 @@ def train(inputs, instr_inputs = None):
         
         instr_loss /= instr_curr_batch.size(1)
         instr_loss.backward()
+        torch.nn.utils.clip_grad_norm(instr_model.parameters(), args.clip)
         instr_opt.step()
             
 
@@ -491,6 +495,7 @@ def generate(recipe_model, instr_model, prime_str='a', predict_len=60, temperatu
             # Sample from the network as a multinomial distribution
             output_dist = output.data.view(-1).div(temperature).exp()
             top_i = torch.multinomial(output_dist, 1)[0]
+            #top_k, top_i = output.data.topk(1)
 
             # Add predicted character to string and use as next input
             predicted_char = instr_ind_2_word[top_i.item()]
@@ -522,6 +527,10 @@ def time_since(since):
     m = math.floor(s / 60)
     s -= m * 60
     return '%dm %ds' % (m, s)
+
+if(args.instr_load is not None):
+    print("Loading instruction weights from file...")
+    instr_model.load_state_dict(torch.load(args.instr_load))
 
 if(args.load is not None):
     print("Loading weights from file...")
