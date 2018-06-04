@@ -17,7 +17,7 @@ import numpy as np
 
 #standard line cleaning
 def clean_line(line):
-    return line.replace("'","").replace(",","").replace(":","").replace(";","").replace("(","").replace(")","").replace("&#39", "").replace("\n", " <EOL>").lower()
+    return line.replace("'","").replace(",","").replace(":","").replace(";","").replace("(","").replace(")","").replace("&#39", "").replace("\n", " <eol>").replace(".", " .").lower()
 
 #Clean and concatenate recipe files
 def concat_recipes(recipe_files, outfile_name):
@@ -87,12 +87,13 @@ def load_recipes(recipe_files, word_2_ind, max_length = 100, gpu = 0):
         if(gpu != -1):
             var = var.cuda(gpu)
         l = var.size(0)
-        recipe_tensors.append((l + random.random() * 0.0001, var)) #include lengths to sort by, random perturbation to avoid same-length collisions
+        #recipe_tensors.append((l + len(recipe_tensors) * 0.000001, var)) #include lengths to sort by
+        recipe_tensors.append(var)
         recipes_loaded.append(recipe)
 
     #Sort and extract tensors only
-    recipe_tensors = [ele[1] for ele in sorted(recipe_tensors, reverse = True)]
-    recipe_tensors = torch.nn.utils.rnn.pad_sequence(recipe_tensors).permute(1,0)
+    #recipe_tensors = [ele[1] for ele in sorted(recipe_tensors, reverse = True)]
+    #recipe_tensors = torch.nn.utils.rnn.pad_sequence(recipe_tensors).permute(1,0)
     return recipe_tensors, recipes_loaded
 
 
@@ -144,9 +145,12 @@ parser.add_argument('--instructions', action='store_true', default = False,
                     help='Use recipe files containing both ingredients and instructions versus only ingredients. This makes the task much more difficult.')
 parser.add_argument('--instr_embedding', type=str, default='./glove_recipe_instr_vectors_100.txt',
                     help='Path of GloVe embedding definition file for instructions')
+parser.add_argument('--instr_max_length', type=int, default=200,
+                    help='Max length for instruction sequences')
 parser.add_argument('--instr_load', type=str, default=None,
                     help='Path to saved weights for instruction generation network')
-
+parser.add_argument('--teacher_forcing_ratio', type=float, default=0.5,
+                    help='Fraction of the time to use teacher forcing')
 parser.add_argument('--concat', type=str, default=None,
                     help='Clean and concatenate recipe files for embedding processing, then exit')
 args = parser.parse_args()
@@ -196,7 +200,7 @@ class recipeRNN(nn.Module):
         self.drop = nn.Dropout(drop_freq)
 
         self.encoder = embedding
-        self.rnn = nn.LSTM(input_size, hidden_size, n_layers, batch_first = True, dropout = drop_freq)
+        self.rnn = nn.GRU(input_size, hidden_size, n_layers, batch_first = True, dropout = drop_freq)
           
         self.decoder = nn.Linear(hidden_size, output_size)
         if(self.tie_weights):
@@ -216,11 +220,12 @@ class recipeRNN(nn.Module):
 
     def init_hidden(self, batch_size, gpu = -1):
         h = torch.zeros(self.n_layers, batch_size, self.hidden_size)
-        c = torch.zeros(self.n_layers, batch_size, self.hidden_size)
+        #c = torch.zeros(self.n_layers, batch_size, self.hidden_size)
         if(gpu != -1):
             h = h.cuda(gpu)
-            c = c.cuda(gpu)
-        return (h,c)
+            #c = c.cuda(gpu)
+        #return (h,c)
+        return h
 
 #Attentional RNN model for generating instructions given ingredients
 class ingr2instrRNN(nn.Module):
@@ -294,13 +299,20 @@ class ingr2instrRNN(nn.Module):
 #Let's load and clean our recipe dataset into a list of tensors
 if(args.load is None):
 
-    recipe_tensors, recipes_loaded = load_recipes(recipe_files, word_2_ind, args.max_length, gpu)
     if(args.instructions):
-        #max length here needs to be very large so that we load instructions for every recipe loaded above
-        to_load = [name for name in instr_recipe_files if name.replace("_instructions.txt","_ingredients.txt") in recipes_loaded]
-        instr_recipe_tensors, instr_recipes_loaded = load_recipes(to_load, instr_word_2_ind, 1000000, gpu)
+        #Filter loaded ingredients files based on instructions since these are more likely to hit the length cap
+        instr_recipe_tensors, instr_recipes_loaded = load_recipes(instr_recipe_files, instr_word_2_ind, args.instr_max_length, gpu)
+        to_load = [name for name in recipe_files if name.replace("_ingredients.txt","_instructions.txt") in instr_recipes_loaded]
+        length = 1000000
+    else:
+        to_load = recipe_files
+        length = args.max_length
+    recipe_tensors, recipes_loaded = load_recipes(to_load, word_2_ind, length, gpu)
 
-    print("Loaded " + str(recipe_tensors.size(0)) + " recipes")
+
+    #print(recipes_loaded[len(recipes_loaded)-1], instr_recipes_loaded[len(instr_recipes_loaded)-1])
+    print("Loaded " + str(len(recipe_tensors)) + " recipes")
+    print("Rejected " + str(len(recipe_files) - len(recipe_tensors)) + " recipes")
 
 #Set up and train!
 
@@ -349,13 +361,16 @@ if(args.instructions):
 
 #pre-allocated Tensor to hold current batch
 if(args.load is None):
-    curr_batch = torch.LongTensor(args.batch_size, recipe_tensors.size(1))
+    curr_batch = torch.LongTensor(args.batch_size, args.max_length)
     if(args.gpu):
         curr_batch = curr_batch.cuda(gpu)
     if(args.instructions):
-        instr_curr_batch = torch.LongTensor(args.batch_size, instr_recipe_tensors.size(1))
+        instr_curr_batch = torch.LongTensor(args.batch_size, args.instr_max_length)
+        #Mask to block padding values for encoder representation
+        curr_batch_mask = torch.zeros_like(curr_batch).float()
         if(args.gpu):
             instr_curr_batch = instr_curr_batch.cuda(gpu)
+            curr_batch_mask = curr_batch_mask.cuda(gpu)
 
 #Train by predicting next word given current word and hidden state
 #Batches currently handled by running on multiple sequences in series, accumulating gradient updates before calling opt. 
@@ -366,21 +381,49 @@ def train(inputs, instr_inputs = None):
 
     loss = 0
 
+    curr_batch.fill_(word_2_ind["<eos>"])
+    if(instr_inputs is not None):
+        curr_batch_mask.fill_(0)
+        instr_curr_batch.fill_(instr_word_2_ind["<eos>"])
     for b in range(args.batch_size):
-        rand_ind = int(math.floor(random.random() * inputs.size(0)))
-        curr_seq = inputs[rand_ind]        
-        curr_batch[b] = curr_seq
+        rand_ind = int(math.floor(random.random() * len(inputs)))
+        curr_seq = inputs[rand_ind]
+        #print(curr_seq.size())
+        max_ind = min(curr_seq.size(0), args.max_length)
+        curr_batch[b,:max_ind] = curr_seq[:max_ind]
+        #curr_batch[b] = curr_seq
         #Indices should be matched up, I think...
         if(instr_inputs is not None):
-            instr_curr_batch[b] = instr_inputs[rand_ind]
+            curr_batch_mask[b,:max_ind].fill_(1)
+            instr_curr_seq = instr_inputs[rand_ind]
+            max_ind = min(instr_curr_seq.size(0), args.instr_max_length)
+            instr_curr_batch[b,:max_ind] = instr_curr_seq[:max_ind]
+
+        #for ele in curr_seq:
+        #    print(ind_2_word[ele.item()])
+        #for ele in instr_inputs[rand_ind]:
+        #    print(instr_ind_2_word[ele.item()])
         
     ind = 0
     loss = 0
-    while ind + 1 < curr_batch.size(1):
+    #Select use of teacher forcing randomly
+    tf_choice = random.random()
+    if(tf_choice < args.teacher_forcing_ratio):
+        while ind + 1 < curr_batch.size(1):
+            output, hidden = recipe_model(curr_batch[:,ind:ind+1], hidden)
+            loss += criterion(output, curr_batch[:,ind+1])
+            ind += 1
+    #Use previous prediction as input
+    else:
+        ingr_input = curr_batch[:,ind:ind+1]
+        while ind + 1 < curr_batch.size(1):
+            output, hidden = recipe_model(ingr_input, hidden)
+            loss += criterion(output, curr_batch[:,ind+1])
+            ind += 1
+            topv, topi = output.topk(1)
+            #Need to detach to not backprop across inputs
+            ingr_input = topi.detach()
 
-        output, hidden = recipe_model(curr_batch[:,ind:ind+1], hidden)
-        loss += criterion(output, curr_batch[:,ind+1])
-        ind += 1
 
     #targets = Variable(curr_seq.data.new().resize_(curr_seq.size()))
     #targets[0,0:targets.size(1) - 1] = curr_seq[0,1:]
@@ -397,9 +440,9 @@ def train(inputs, instr_inputs = None):
     #Now train instruction generator
     #First, encode ingredients
     #TODO This could be merged with generation above?
-    instr_loss = 0
+    instr_loss = torch.tensor([0])
     if(instr_inputs is not None):
-
+        instr_loss = 0
         instr_model.zero_grad()
 
         encoder_outputs = torch.zeros(args.batch_size, args.max_length, args.nhid)
@@ -414,10 +457,30 @@ def train(inputs, instr_inputs = None):
         #now, attend encoding and decode/generate
         ind = 0
         instr_hidden = encoder_hidden
-        while ind + 1 < instr_curr_batch.size(1):
-            instr_output, instr_hidden, instr_attention = instr_model.forward_decoder(instr_curr_batch[:,ind:ind+1], instr_hidden, encoder_outputs)
-            instr_loss += criterion(instr_output, instr_curr_batch[:,ind+1])
-            ind += 1
+        #First, mask the encoder output to block padding values
+        #Mask is batchXmax_len, need to expand to batchXmax_lenXhsize
+        encoder_outputs.mul_(curr_batch_mask.expand(encoder_outputs.size(2),-1,-1).permute(1,2,0))
+
+        #Randomly choose to either use teacher forcing(GT input for previous word) or the network's prediction
+        tf_choice = random.random()
+        if(tf_choice < args.teacher_forcing_ratio):
+            while ind + 1 < instr_curr_batch.size(1):
+                instr_output, instr_hidden, instr_attention = instr_model.forward_decoder(instr_curr_batch[:,ind:ind+1], instr_hidden, encoder_outputs)
+                instr_loss += criterion(instr_output, instr_curr_batch[:,ind+1])
+                ind += 1
+        #Use previous network prediction as input
+        else:
+            instr_input = instr_curr_batch[:,ind:ind+1]
+            while ind + 1 < instr_curr_batch.size(1):
+                instr_output, instr_hidden, instr_attention = instr_model.forward_decoder(instr_input, instr_hidden, encoder_outputs)
+                instr_loss += criterion(instr_output, instr_curr_batch[:,ind+1])
+                ind += 1
+                #Get prediction
+                #TODO maybe make this probabilistic?
+                topv, topi = instr_output.topk(1)
+                #Need to detach to not backprop across inputs
+                instr_input = topi.detach()
+                #TODO handle when the network outputs EOS?
         
         instr_loss /= instr_curr_batch.size(1)
         instr_loss.backward()
@@ -432,14 +495,23 @@ def train(inputs, instr_inputs = None):
 
 def generate(recipe_model, instr_model, prime_str='a', predict_len=60, temperature=0.8, cuda=False):
 
+    outp = torch.zeros(1, predict_len).long()
+    outp.fill_(word_2_ind["<eol>"])
+    outp_ind = 0
+
     #parse the priming string
-    tokens = []
+    tokens = [word_2_ind["<sos>"]]
     prime_tok = clean_line(prime_str).split(" ")
     for tok in prime_tok:
         if(tok in word_2_ind.keys()):
             tokens.append(word_2_ind[tok])
+            outp[:,outp_ind] = word_2_ind[tok]
+            outp_ind += 1
         else: #unknown word
             tokens.append(word_2_ind["<unk>"])
+            outp[:,outp_ind] = word_2_ind["<unk>"]
+            outp_ind += 1
+
     prime_input = torch.LongTensor(tokens).unsqueeze(0)
 
     hidden = recipe_model.init_hidden(1, gpu)
@@ -451,7 +523,7 @@ def generate(recipe_model, instr_model, prime_str='a', predict_len=60, temperatu
         _, hidden = recipe_model(prime_input[:,p], hidden)
         
     inp = prime_input[:,-1]
-    outp = torch.zeros(1, predict_len).long()
+
     if cuda:
         outp = outp.cuda(gpu)
     
@@ -461,9 +533,11 @@ def generate(recipe_model, instr_model, prime_str='a', predict_len=60, temperatu
         # Sample from the network as a multinomial distribution
         output_dist = output.data.view(-1).div(temperature).exp()
         top_i = torch.multinomial(output_dist, 1)[0]
+        #top_k, top_i = output.data.topk(1)
 
-        if(instr_model is not None):
-            outp[:,p] = top_i.item()
+        if(instr_model is not None and outp_ind < outp.size(1)):
+            outp[:,outp_ind] = top_i.item()
+            outp_ind += 1
 
         # Add predicted character to string and use as next input
         predicted_char = ind_2_word[top_i.item()]
@@ -488,7 +562,7 @@ def generate(recipe_model, instr_model, prime_str='a', predict_len=60, temperatu
         decoder_input = torch.LongTensor([instr_word_2_ind["<sos>"]]).unsqueeze(0)
         if cuda:
             decoder_input = decoder_input.cuda(gpu)
-        for p in range(predict_len):
+        for p in range(args.instr_max_length):
 
             output, instr_hidden, instr_attention = instr_model.forward_decoder(decoder_input, instr_hidden, encoder_outputs)
 
@@ -505,10 +579,6 @@ def generate(recipe_model, instr_model, prime_str='a', predict_len=60, temperatu
             decoder_input = torch.LongTensor([instr_word_2_ind[predicted_char]]).unsqueeze(0)
             if cuda:
                 decoder_input = decoder_input.cuda(gpu)
-
-
-            
-        
 
     return predicted
 
@@ -573,7 +643,11 @@ n_sampled = 0
 while n_sampled < args.n_to_generate:
     recipe = generate(recipe_model, instr_model, args.prime_str, args.max_length, temperature= 0.8, cuda=args.gpu)
     if(args.contains_str is not None):
-        if(args.contains_str in recipe):
+        accept = True
+        for tok in args.contains_str.split(" "):
+            if(not tok in recipe):
+                accept = False
+        if(accept):
             print(recipe)
             n_sampled += 1
     else:
