@@ -1,5 +1,9 @@
 #Learn to model recipes and generate new ones via lstm
 
+#TODO Add attention over previous decoder outputs(maybe for ingredients too?) based on paulus, xiong, socher, 2017
+
+#TODO Add REINFORCE updates on non-teacher-forcing network outputs- incentivise outputting words which make the network better at predicting future words as well as matching the current target word.
+
 import os, sys, re
 import time, math, random
 import torch
@@ -153,6 +157,10 @@ parser.add_argument('--teacher_forcing_ratio', type=float, default=0.5,
                     help='Fraction of the time to use teacher forcing')
 parser.add_argument('--concat', type=str, default=None,
                     help='Clean and concatenate recipe files for embedding processing, then exit')
+parser.add_argument('--save_every', type=int, default=2000,
+                    help='Frequency to save out network weights during training')
+parser.add_argument('--resume', action='store_true', default = False,
+                    help='If --load is specified, continue training rather than generating samples')
 args = parser.parse_args()
 
 # Set the random seed manually for reproducibility.
@@ -242,17 +250,17 @@ class ingr2instrRNN(nn.Module):
 
         #Encoder stuff for ingredients
         self.encoder_ingr = ingr_embedding
-        self.rnn_ingr = nn.GRU(input_size, hidden_size, n_layers, batch_first = True, dropout = drop_freq)
+        self.rnn_ingr = nn.GRU(input_size, hidden_size, n_layers, batch_first = True, dropout = drop_freq, bidirectional = True)
 
         #Decoder stuff for instructions
         self.encoder_instr = instr_embedding
-        self.attn = nn.Linear(self.hidden_size * (n_layers + 1), self.max_length)
-        self.attn_combine = nn.Linear(self.hidden_size * 2, self.hidden_size)
+        self.attn = nn.Linear(self.hidden_size * (n_layers*2 + 1), self.max_length)
+        self.attn_combine = nn.Linear(self.hidden_size * 3, self.hidden_size)
         self.drop_instr = nn.Dropout(drop_freq)
 
-        self.rnn_instr = nn.GRU(hidden_size, hidden_size, n_layers, batch_first = True, dropout = drop_freq)
+        self.rnn_instr = nn.GRU(hidden_size, hidden_size * 2, n_layers, batch_first = True, dropout = drop_freq)
 
-        self.out = nn.Linear(hidden_size, output_size)
+        self.out = nn.Linear(hidden_size * 2, output_size)
 
     def forward_encoder(self, input, hidden):
         encoded = self.encoder_ingr(input)
@@ -266,8 +274,7 @@ class ingr2instrRNN(nn.Module):
     def forward_decoder(self, input, hidden, encoder_outputs):
         output = self.encoder_instr(input)
         output = self.drop_instr(output)
-
-        concat = torch.cat((output, hidden.permute(1,0,2)), 1)
+        concat = torch.cat((output, hidden.view(hidden.size(1), 1, -1)), 2)
         concat = concat.reshape(concat.size(0), -1)
         attn_weights = self.attn(concat)
         attn_weights = F.softmax(attn_weights, dim=1)
@@ -277,8 +284,8 @@ class ingr2instrRNN(nn.Module):
 
         output = torch.cat((output, attn_applied), 2)
         output = self.attn_combine(output)
-
         output = F.relu(output)
+
         output, hidden = self.rnn_instr(output, hidden)
 
         output = self.out(output.squeeze())
@@ -286,7 +293,8 @@ class ingr2instrRNN(nn.Module):
         return output, hidden, attn_weights
 
     def init_hidden(self, batch_size, gpu = -1):
-        h = torch.zeros(self.n_layers, batch_size, self.hidden_size)
+        #For bidirectional encoder
+        h = torch.zeros(self.n_layers * 2, batch_size, self.hidden_size)
         #c = torch.zeros(self.n_layers, batch_size, self.hidden_size)
         if(gpu != -1):
             h = h.cuda(gpu)
@@ -297,7 +305,7 @@ class ingr2instrRNN(nn.Module):
 
 
 #Let's load and clean our recipe dataset into a list of tensors
-if(args.load is None):
+if(args.load is None or args.resume):
 
     if(args.instructions):
         #Filter loaded ingredients files based on instructions since these are more likely to hit the length cap
@@ -360,7 +368,7 @@ if(args.instructions):
     instr_opt = torch.optim.Adam(instr_model.parameters(), lr=args.lr)
 
 #pre-allocated Tensor to hold current batch
-if(args.load is None):
+if(args.load is None or args.resume):
     curr_batch = torch.LongTensor(args.batch_size, args.max_length)
     if(args.gpu):
         curr_batch = curr_batch.cuda(gpu)
@@ -406,6 +414,12 @@ def train(inputs, instr_inputs = None):
         
     ind = 0
     loss = 0
+    #If we are not using teacher forcing, we should provide the output of the ingredient network to the instruction network encoder
+    ingr_outp = torch.zeros(args.batch_size, curr_batch.size(1)).long()
+    if(args.gpu):
+        ingr_outp = ingr_outp.cuda(gpu)
+    ingr_outp.fill_(word_2_ind["<eos>"])
+    
     #Select use of teacher forcing randomly
     tf_choice = random.random()
     if(tf_choice < args.teacher_forcing_ratio):
@@ -416,6 +430,7 @@ def train(inputs, instr_inputs = None):
     #Use previous prediction as input
     else:
         ingr_input = curr_batch[:,ind:ind+1]
+        ingr_outp[:,ind] = ingr_input.squeeze()
         while ind + 1 < curr_batch.size(1):
             output, hidden = recipe_model(ingr_input, hidden)
             loss += criterion(output, curr_batch[:,ind+1])
@@ -423,6 +438,7 @@ def train(inputs, instr_inputs = None):
             topv, topi = output.topk(1)
             #Need to detach to not backprop across inputs
             ingr_input = topi.detach()
+            ingr_outp[:,ind] = ingr_input.squeeze()
 
 
     #targets = Variable(curr_seq.data.new().resize_(curr_seq.size()))
@@ -450,19 +466,27 @@ def train(inputs, instr_inputs = None):
         if(args.gpu):
             encoder_outputs = encoder_outputs.cuda(gpu)
 
-        for ingr in range(curr_batch.size(1)):
-            encoder_output, encoder_hidden = instr_model.forward_encoder(curr_batch[:,ingr:ingr+1], encoder_hidden)
-            #print(encoder_outputs[:,ingr,:].unsqueeze(1).size(), encoder_output.size())
-            encoder_outputs[:,ingr,:] = encoder_output.squeeze()
+        #Use ingredient network output if not teacher forcing
+        if(tf_choice < args.teacher_forcing_ratio):
+            encoder_input = curr_batch
+        else:
+            encoder_input = ingr_outp
+
+        encoder_output, encoder_hidden = instr_model.forward_encoder(encoder_input, encoder_hidden)
+        encoder_outputs = encoder_output
+        #for ingr in range(curr_batch.size(1)):
+        #    encoder_output, encoder_hidden = instr_model.forward_encoder(encoder_input[:,ingr:ingr+1], encoder_hidden)
+        #    encoder_outputs[:,ingr,:] = encoder_output.squeeze()
         #now, attend encoding and decode/generate
         ind = 0
-        instr_hidden = encoder_hidden
+        #For bidirectional encoder, concat the hidden states for both directions and feed into decoder
+        #Ordering of layer hidden states should be 1-1,2-1,3-1,1-2,2-2,3-2 I think...
+        instr_hidden = torch.cat([encoder_hidden[:instr_model.n_layers], encoder_hidden[instr_model.n_layers:]], 2)
         #First, mask the encoder output to block padding values
         #Mask is batchXmax_len, need to expand to batchXmax_lenXhsize
-        encoder_outputs.mul_(curr_batch_mask.expand(encoder_outputs.size(2),-1,-1).permute(1,2,0))
+        encoder_outputs = encoder_outputs.mul(curr_batch_mask.expand(encoder_outputs.size(2),-1,-1).permute(1,2,0))
 
         #Randomly choose to either use teacher forcing(GT input for previous word) or the network's prediction
-        tf_choice = random.random()
         if(tf_choice < args.teacher_forcing_ratio):
             while ind + 1 < instr_curr_batch.size(1):
                 instr_output, instr_hidden, instr_attention = instr_model.forward_decoder(instr_curr_batch[:,ind:ind+1], instr_hidden, encoder_outputs)
@@ -496,7 +520,7 @@ def train(inputs, instr_inputs = None):
 def generate(recipe_model, instr_model, prime_str='a', predict_len=60, temperature=0.8, cuda=False):
 
     outp = torch.zeros(1, predict_len).long()
-    outp.fill_(word_2_ind["<eol>"])
+    outp.fill_(word_2_ind["<eos>"])
     outp_ind = 0
 
     #parse the priming string
@@ -550,14 +574,17 @@ def generate(recipe_model, instr_model, prime_str='a', predict_len=60, temperatu
 
     #Now generate instructions to go with ingredients
     if(instr_model is not None):
-        instr_hidden = instr_model.init_hidden(1, gpu)
-        encoder_outputs = torch.zeros(1, args.max_length, args.nhid)
-        if cuda:
-            encoder_outputs = encoder_outputs.cuda(gpu)
+        encoder_hidden = instr_model.init_hidden(1, gpu)
+        #encoder_outputs = torch.zeros(1, args.max_length, args.nhid * 2)
+        #if cuda:
+        #    encoder_outputs = encoder_outputs.cuda(gpu)
         #encode
-        for p in range(outp.size(1)):
+        encoder_outputs, encoder_hidden = instr_model.forward_encoder(outp, encoder_hidden)
+        instr_hidden = torch.cat([encoder_hidden[:instr_model.n_layers], encoder_hidden[instr_model.n_layers:]], 2)
+
+        #for p in range(outp.size(1)):
             #print(outp.size(), outp[:,p])
-            encoder_outputs[0,p], instr_hidden = instr_model.forward_encoder(outp[:,p:p+1], instr_hidden)
+       #     encoder_outputs[0,p], instr_hidden = instr_model.forward_encoder(outp[:,p:p+1], instr_hidden)
         #decode
         decoder_input = torch.LongTensor([instr_word_2_ind["<sos>"]]).unsqueeze(0)
         if cuda:
@@ -606,8 +633,8 @@ if(args.load is not None):
     print("Loading weights from file...")
     weights_filename = args.load
     recipe_model.load_state_dict(torch.load(weights_filename))
-else:
 
+if(args.load is None or args.resume):
     print("Training for %d epochs..." % args.iters)
     for epoch in range(1, args.iters + 1):
         instr_input = None
@@ -629,12 +656,13 @@ else:
             loss_avg = 0
             instr_loss_avg = 0
 
-    #Save model to file
-    torch.save(recipe_model, args.save + ".model")
-    torch.save(recipe_model.state_dict(), args.save + ".weights")
-    if(args.instructions):
-        torch.save(instr_model, args.save + "_instr.model")
-        torch.save(instr_model.state_dict(), args.save + "_instr.weights")
+        if epoch % args.save_every == 0:
+            #Save model to file
+            torch.save(recipe_model, args.save + ".model")
+            torch.save(recipe_model.state_dict(), args.save + ".weights")
+            if(args.instructions):
+                torch.save(instr_model, args.save + "_instr.model")
+                torch.save(instr_model.state_dict(), args.save + "_instr.weights")
 
 recipe_model.train(False)
 if(args.instructions):
