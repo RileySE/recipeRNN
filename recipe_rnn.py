@@ -21,7 +21,7 @@ import numpy as np
 
 #standard line cleaning
 def clean_line(line):
-    return line.replace("'","").replace(",","").replace(":","").replace(";","").replace("(","").replace(")","").replace("&#39", "").replace("\n", " <eol>").replace(".", " .").lower()
+    return line.replace("'","").replace(","," ,").replace(":","").replace(";","").replace("(","( ").replace(")"," )").replace("&#39", "").replace("\n", " <eol>").replace(".", " .").lower()
 
 #Clean and concatenate recipe files
 def concat_recipes(recipe_files, outfile_name):
@@ -153,8 +153,10 @@ parser.add_argument('--instr_max_length', type=int, default=200,
                     help='Max length for instruction sequences')
 parser.add_argument('--instr_load', type=str, default=None,
                     help='Path to saved weights for instruction generation network')
-parser.add_argument('--teacher_forcing_ratio', type=float, default=0.5,
+parser.add_argument('--teacher_forcing_ratio', type=float, default=1.0,
                     help='Fraction of the time to use teacher forcing')
+parser.add_argument('--temperature', type=float, default=0.8,
+                    help='Temperature to use for sampling from the RNN distribution')
 parser.add_argument('--concat', type=str, default=None,
                     help='Clean and concatenate recipe files for embedding processing, then exit')
 parser.add_argument('--save_every', type=int, default=2000,
@@ -652,7 +654,7 @@ if(args.load is None or args.resume):
                 instr_model.train(False)
             print('[%s (%d %d%%) %.4f %.4f]' % (time_since(start), epoch, epoch / args.iters * args.batch_size, loss_avg / args.print_every, instr_loss_avg / args.print_every))
             print('loss: ', loss, instr_loss)
-            print(generate(recipe_model, instr_model, args.prime_str, args.max_length, 0.8, cuda=args.gpu) + "\n")
+            print(generate(recipe_model, instr_model, args.prime_str, args.max_length, args.temperature, cuda=args.gpu) + "\n")
             loss_avg = 0
             instr_loss_avg = 0
 
@@ -669,7 +671,7 @@ if(args.instructions):
     instr_model.train(False)
 n_sampled = 0
 while n_sampled < args.n_to_generate:
-    recipe = generate(recipe_model, instr_model, args.prime_str, args.max_length, temperature= 0.8, cuda=args.gpu)
+    recipe = generate(recipe_model, instr_model, args.prime_str, args.max_length, temperature= args.temperature, cuda=args.gpu)
     if(args.contains_str is not None):
         accept = True
         for tok in args.contains_str.split(" "):
